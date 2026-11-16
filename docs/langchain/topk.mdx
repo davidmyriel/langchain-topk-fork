@@ -187,7 +187,7 @@ retriever.invoke("garbage collection")
     icon="search"
     arrow
 >
-    Guide on how to use this vector store for retrieval-augmented generation (RAG)
+Guide on how to use this vector store for retrieval-augmented generation (RAG)
 </Card>
 
 ---
@@ -197,7 +197,7 @@ retriever.invoke("garbage collection")
 `TopKVectorStore` supports several retrieval modes. Set a default with `retrieval_mode=` when you create the store, or pass `mode=` to any search call:
 
 | Mode | What it scores | Needs |
-|------|----------------|-------|
+| --- | --- | --- |
 | `"semantic"` | TopK's server-side embeddings and reranking | Nothing (default without `embedding`) |
 | `"keyword"` | BM25 | Nothing |
 | `"dense"` | Your own embeddings | `embedding` |
@@ -282,7 +282,7 @@ Metadata fields are under `metadata.`, for example `field("metadata.year")`. A B
 Pass `filter` as a dict. Keys are metadata keys, and multiple keys are combined with AND:
 
 | Operator | Meaning |
-|----------|---------|
+| --- | --- |
 | `{"key": value}` or `$eq` | Equal |
 | `$ne` | Not equal |
 | `$gt`, `$gte`, `$lt`, `$lte` | Comparison |
@@ -342,7 +342,7 @@ retriever.invoke("languages with a garbage collector released after 2000")
 
 ### Bring your own embeddings
 
-Pass any LangChain [embedding model](/oss/integrations/text_embedding) as `embedding` to store dense vectors and run [vector search](https://docs.topk.io/guides/vector-search). The collection gets a vector index of the embedding's dimension. Choose the metric with `distance_metric` (`"cosine"`, `"dot_product"` or `"euclidean"`):
+Pass any LangChain [embedding model](/oss/integrations/embeddings) as `embedding` to store dense vectors and run [vector search](https://docs.topk.io/guides/vector-search). The collection gets a vector index of the embedding's dimension. Choose the metric with `distance_metric` (`"cosine"`, `"dot_product"` or `"euclidean"`):
 
 <EmbeddingTabs/>
 

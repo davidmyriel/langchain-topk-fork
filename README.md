@@ -65,7 +65,7 @@ retriever.invoke("garbage collection")
 Set a default with `retrieval_mode=` or pass `mode=` to any search call (also through `as_retriever(search_kwargs=...)`):
 
 | Mode | What it scores | Needs |
-|------|----------------|-------|
+| --- | --- | --- |
 | `"semantic"` | TopK's server-side embeddings and reranking | Nothing (default without `embedding`) |
 | `"keyword"` | BM25 | Nothing |
 | `"dense"` | Your own embeddings | `embedding=` any LangChain `Embeddings` |
