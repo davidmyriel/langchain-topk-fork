@@ -21,7 +21,16 @@ import uuid
 
 from topk_sdk import Client
 
-SKIP_MARKERS = ("pip install", "uv add", "getpass", "LANGSMITH")
+# Setup blocks: installs, credentials, and third-party model providers that
+# need their own API keys (replaced below by local or fake models).
+SKIP_MARKERS = (
+    "pip install",
+    "uv add",
+    "getpass",
+    "LANGSMITH",
+    "OpenAIEmbeddings(",
+    "init_chat_model(",
+)
 
 
 def blocks(path: str) -> list[tuple[str, str]]:
