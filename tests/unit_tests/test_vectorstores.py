@@ -195,8 +195,13 @@ def test_add_texts_semantic_sends_no_vectors() -> None:
     _, key, rows = client.last("upsert")
     assert key == ("test", None)
     assert rows == [
-        {"_id": "1", "text": "a", "metadata": {"lang": "rust"}},
-        {"_id": "2", "text": "b"},
+        {
+            "_id": "1",
+            "text": "a",
+            "metadata": {"lang": "rust"},
+            "metadata_json": '{"lang": "rust"}',
+        },
+        {"_id": "2", "text": "b", "metadata_json": "{}"},
     ]
     assert store.last_lsn == "1"
 
@@ -314,6 +319,26 @@ def test_semantic_search_query() -> None:
     assert "field(metadata.n)" in q
     assert "Limit { k: 3 }" in q
     assert "order: Desc" in q
+
+
+def test_search_reads_metadata_from_json_copy() -> None:
+    store, client = make_store()
+    store.add_texts(["a"], ids=["1"])
+    client.query_results = [
+        {"_id": "1", "text": "a", "metadata_json": '{"n": 1}', "semantic_score": 1.0}
+    ]
+    assert store.similarity_search("q")[0].metadata == {"n": 1}
+    assert "Logical(field(metadata_json))" in repr(client.last("query")[2])
+    assert not [c for c in client.calls if c[0] == "get"]
+
+
+def test_search_fetches_metadata_for_external_documents() -> None:
+    store, client = make_store()
+    client.data[("test", None)]["ext"] = {"_id": "ext", "metadata": {"src": "x"}}
+    client.query_results = [{"_id": "ext", "text": "external", "semantic_score": 1.0}]
+    docs = store.similarity_search("q")
+    assert docs[0].metadata == {"src": "x"}
+    assert client.last("get")[3] == ["metadata"]
 
 
 def test_keyword_search_query() -> None:

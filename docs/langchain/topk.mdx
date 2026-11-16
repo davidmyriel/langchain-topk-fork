@@ -439,7 +439,7 @@ tenants.list_partitions()
 TopK supports several [read consistency levels](https://docs.topk.io/concepts#read-consistency):
 
 - **Balanced** (default): new writes are searchable in under a second.
-- **Indexed**: reads use only indexed data, for the lowest latency.
+- **Indexed**: reads use only indexed data, for the lowest latency. Documents written in the last few seconds may not be visible yet.
 - **Strong**: every read sees every acknowledged write.
 - **LSN**: every write returns a log sequence number (LSN). A read that passes it sees that write.
 
@@ -455,13 +455,13 @@ vector_store.get_by_ids(["zig"], lsn=lsn)
 
 ### Run any TopK query
 
-For anything the options above don't cover, `search_with_query` runs a query written with the [TopK query builder](https://docs.topk.io/collections/query) against the store's collection and partition. Select `"text"` and `"metadata"` to fill `page_content` and `metadata`. Other selected values are added to each document's metadata:
+For anything the options above don't cover, `search_with_query` runs a query written with the [TopK query builder](https://docs.topk.io/collections/query) against the store's collection and partition. Select `"text"` to fill `page_content`; metadata is filled in for you. Other selected values are added to each document's metadata:
 
 ```python Raw TopK query icon="code"
 from topk_sdk.query import field, fn, select
 
 vector_store.search_with_query(
-    select("text", "metadata", score=fn.semantic_similarity("text", "databases"))
+    select("text", score=fn.semantic_similarity("text", "databases"))
     .filter(field("metadata.year") < 2000)
     .sort(field("score"), asc=False)
     .limit(2)

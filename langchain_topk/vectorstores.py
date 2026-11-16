@@ -226,6 +226,7 @@ class TopKVectorStore(VectorStore):
         async_client: AsyncClient | None = None,
         text_field: str = "text",
         metadata_field: str = "metadata",
+        metadata_json_field: str = "metadata_json",
         vector_field: str = "dense_vector",
         sparse_vector_field: str = "sparse_vector",
         multi_vector_field: str = "multi_vector",
@@ -259,6 +260,12 @@ class TopKVectorStore(VectorStore):
                 methods.
             text_field: Field that stores `Document.page_content`.
             metadata_field: Struct field that stores `Document.metadata`.
+                Filters run against it, for example `metadata.year`.
+            metadata_json_field: Field that stores a JSON copy of the
+                metadata. TopK queries return only the fields they name, not a
+                whole struct, so searches read metadata from this copy in the
+                same query. Documents without it (for example, written outside
+                LangChain) get their metadata with an extra `get()` by ID.
             vector_field: Field that stores dense vectors.
             sparse_vector_field: Field that stores sparse vectors.
             multi_vector_field: Field that stores multi-vectors.
@@ -293,6 +300,7 @@ class TopKVectorStore(VectorStore):
         self.multi_vector_embedding = multi_vector_embedding
         self.text_field = text_field
         self.metadata_field = metadata_field
+        self.metadata_json_field = metadata_json_field
         self.vector_field = vector_field
         self.sparse_vector_field = sparse_vector_field
         self.multi_vector_field = multi_vector_field
@@ -664,10 +672,13 @@ class TopKVectorStore(VectorStore):
         for idx, (doc_id, content) in enumerate(zip(out_ids, texts, strict=True)):
             row: dict[str, Any] = {"_id": doc_id, self.text_field: content}
             size = 64 + len(doc_id) + len(content.encode("utf-8"))
-            metadata = metadatas[idx] if metadatas is not None else None
+            metadata = dict(metadatas[idx]) if metadatas is not None else {}
+            metadata_json = json.dumps(metadata, default=str, ensure_ascii=False)
+            row[self.metadata_json_field] = metadata_json
+            size += len(metadata_json)
             if metadata:
-                row[self.metadata_field] = dict(metadata)
-                size += len(json.dumps(metadata, default=str))
+                row[self.metadata_field] = metadata
+                size += len(metadata_json)
             if dense is not None:
                 row[self.vector_field] = [float(x) for x in dense[idx]]
                 size += 4 * len(row[self.vector_field])
@@ -928,6 +939,8 @@ class TopKVectorStore(VectorStore):
 
     def _row_to_document(self, row: Mapping[str, Any]) -> Document:
         metadata = row.get(self.metadata_field)
+        if not metadata and row.get(self.metadata_json_field):
+            metadata = json.loads(row[self.metadata_json_field])
         return Document(
             id=row.get("_id"),
             page_content=row.get(self.text_field) or "",
@@ -1036,7 +1049,7 @@ class TopKVectorStore(VectorStore):
                 matrix_data(normalize_multi_vector(multi_vector), value_type="f32"),
             )
 
-        q = select(self.text_field, self.metadata_field, **scores)
+        q = select(self.text_field, self.metadata_json_field, **scores)
         if text_filter is not None:
             q = q.filter(text_filter)
         expr = build_filter(filter, self.metadata_field)
@@ -1141,15 +1154,46 @@ class TopKVectorStore(VectorStore):
         build = {k: v for k, v in kwargs.items() if k in allowed}
         return build, read
 
+    def _needs_metadata(self, rows: list[dict[str, Any]]) -> list[str]:
+        return [
+            r["_id"]
+            for r in rows
+            if self.metadata_json_field not in r and self.metadata_field not in r
+        ]
+
+    def _merge_metadata(
+        self, rows: list[dict[str, Any]], found: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        for row in rows:
+            metadata = found.get(row["_id"], {}).get(self.metadata_field)
+            if metadata is not None:
+                row[self.metadata_field] = metadata
+
     def _run(self, q: Query, read: Mapping[str, Any]) -> list[dict[str, Any]]:
+        options = self._read_options(**read)
         try:
-            return self._collection().query(q, **self._read_options(**read))
+            rows = self._collection().query(q, **options)
+            missing = self._needs_metadata(rows)
+            if missing:
+                found = self._collection().get(
+                    missing, fields=[self.metadata_field], **options
+                )
+                self._merge_metadata(rows, found)
+            return rows
         except PartitionNotFoundError:
             return []
 
     async def _arun(self, q: Query, read: Mapping[str, Any]) -> list[dict[str, Any]]:
+        options = self._read_options(**read)
         try:
-            return await self._acollection().query(q, **self._read_options(**read))
+            rows = await self._acollection().query(q, **options)
+            missing = self._needs_metadata(rows)
+            if missing:
+                found = await self._acollection().get(
+                    missing, fields=[self.metadata_field], **options
+                )
+                self._merge_metadata(rows, found)
+            return rows
         except PartitionNotFoundError:
             return []
 
@@ -1322,16 +1366,16 @@ class TopKVectorStore(VectorStore):
         """Run any TopK query against this store's collection and partition.
 
         Use this when you need the full TopK query language. Select the text
-        and metadata fields to get them back as `page_content` and
-        `metadata`. Any other selected values (for example scores) are added
-        to each document's metadata.
+        field to get it back as `page_content`; each document's metadata is
+        filled in automatically. Any other selected values (for example
+        scores) are added to the document's metadata.
 
         Example:
             ```python
             from topk_sdk.query import field, fn, select
 
             docs = vector_store.search_with_query(
-                select("text", "metadata", score=fn.semantic_similarity("text", "rust"))
+                select("text", score=fn.semantic_similarity("text", "rust"))
                 .filter(field("metadata.year") >= 2020)
                 .sort(field("score"), asc=False)
                 .limit(5)
@@ -1343,7 +1387,12 @@ class TopKVectorStore(VectorStore):
         for row in rows:
             doc = self._row_to_document(row)
             for key, value in row.items():
-                if key not in ("_id", self.text_field, self.metadata_field):
+                if key not in (
+                    "_id",
+                    self.text_field,
+                    self.metadata_field,
+                    self.metadata_json_field,
+                ):
                     doc.metadata[key] = value
             docs.append(doc)
         return docs

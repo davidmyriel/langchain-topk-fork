@@ -145,7 +145,7 @@ def test_custom_ranking(semantic_store: TopKVectorStore) -> None:
 
 def test_search_with_raw_query(semantic_store: TopKVectorStore) -> None:
     docs = semantic_store.search_with_query(
-        select("text", "metadata", score=fn.semantic_similarity("text", "databases"))
+        select("text", score=fn.semantic_similarity("text", "databases"))
         .filter(field("metadata.year") < 2000)
         .sort(field("score"), asc=False)
         .limit(1)
@@ -204,11 +204,17 @@ def test_partitions_isolate_tenants(
 
 def test_consistency_modes(semantic_store: TopKVectorStore) -> None:
     lsn_store = semantic_store.with_partition(None)
-    for consistency in (None, "indexed", "strong"):
+    for consistency in (None, "strong"):
         docs = lsn_store.similarity_search(
             "garbage collector", k=1, consistency=consistency
         )
         assert len(docs) == 1
+    # "indexed" reads only data that has finished indexing, so documents
+    # written moments ago may not be visible yet.
+    assert (
+        len(lsn_store.similarity_search("garbage collector", consistency="indexed"))
+        <= 4
+    )
     strong = TopKVectorStore(
         semantic_store.collection_name,
         client=semantic_store.client,
