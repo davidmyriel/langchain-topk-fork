@@ -1,0 +1,475 @@
+---
+title: TopK integration
+description: Integrate with the TopK vector store using LangChain Python.
+integration:
+  name: TopKVectorStore
+  pypi: langchain-topk
+  delete_by_id: true
+  filtering: true
+  search_by_vector: true
+  search_with_score: true
+  async_api: true
+  passes_standard_tests: true
+  multi_tenancy: true
+  ids_in_add_documents: true
+---
+
+import ChatModelTabs from '/snippets/chat-model-tabs.mdx';
+import EmbeddingTabs from '/snippets/embeddings-tabs-py.mdx';
+
+>[TopK](https://topk.io) is a search database for AI applications. It has built-in semantic search, with embeddings and reranking computed on the server, plus BM25 keyword search, dense, sparse and multi-vector search, metadata filtering and custom scoring. You can combine all of these in a single query.
+
+This guide shows how to use TopK as a LangChain vector store with the `langchain-topk` package. For details on TopK itself, see the [TopK documentation](https://docs.topk.io).
+
+## Setup
+
+To use TopK, create an account in the [TopK console](https://console.topk.io), create an API key, and install the `langchain-topk` integration package.
+
+### Credentials
+
+Set your API key and the [region](https://docs.topk.io/regions) your project runs in:
+
+```python Set API key icon="key"
+import getpass
+import os
+
+if "TOPK_API_KEY" not in os.environ:
+    os.environ["TOPK_API_KEY"] = getpass.getpass("Enter your TopK API key: ")
+
+os.environ.setdefault("TOPK_REGION", "aws-us-east-1-elastica")
+```
+
+To enable automated <Tooltip tip="Log each step of a model's execution to debug and improve it">tracing</Tooltip> of your retrieval calls, set your [LangSmith](/langsmith/observability) API key:
+
+```python Enable tracing icon="flask"
+os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+### Installation
+
+The LangChain TopK integration lives in the `langchain-topk` package:
+
+<CodeGroup>
+    ```python pip
+    pip install -U langchain-topk
+    ```
+    ```python uv
+    uv add langchain-topk
+    ```
+</CodeGroup>
+
+---
+
+## Instantiation
+
+TopK computes embeddings on the server, so you don't need an embedding model or an embedding API key. The store creates the collection on first use:
+
+```python Initialize vector store icon="database"
+from langchain_topk import TopKVectorStore
+
+vector_store = TopKVectorStore(collection_name="langchain-quickstart")
+```
+
+To use your own embedding model instead, pass it as `embedding`. See [Bring your own embeddings](#bring-your-own-embeddings).
+
+---
+
+## Manage vector store
+
+### Add items
+
+```python Add documents icon="folder-plus"
+from langchain_core.documents import Document
+
+documents = [
+    Document(
+        page_content="Rust guarantees memory safety without a garbage collector.",
+        metadata={"lang": "rust", "year": 2015, "tags": ["systems", "safety"]},
+    ),
+    Document(
+        page_content="Python is known for readable syntax and scientific libraries.",
+        metadata={"lang": "python", "year": 1991, "tags": ["scripting", "data"]},
+    ),
+    Document(
+        page_content="Go has a garbage collector and built-in goroutines for concurrency.",
+        metadata={"lang": "go", "year": 2012, "tags": ["systems", "concurrency"]},
+    ),
+    Document(
+        page_content="Haskell is a purely functional language with lazy evaluation.",
+        metadata={"lang": "haskell", "year": 1990, "tags": ["functional"]},
+    ),
+    Document(
+        page_content="SQL queries relational databases with declarative statements.",
+        metadata={"lang": "sql", "year": 1974, "tags": ["data"]},
+    ),
+]
+
+vector_store.add_documents(documents, ids=["rust", "python", "go", "haskell", "sql"])
+```
+
+### Update items
+
+Adding a document with an existing ID replaces it:
+
+```python Update document by ID icon="pencil"
+vector_store.add_documents(
+    [
+        Document(
+            page_content="SQL queries relational databases with declarative statements and joins.",
+            metadata={"lang": "sql", "year": 1974, "tags": ["data"]},
+        )
+    ],
+    ids=["sql"],
+)
+```
+
+### Delete items
+
+Delete by ID, or delete every document that matches a metadata filter:
+
+```python Delete documents icon="trash"
+vector_store.add_documents(
+    [Document(page_content="COBOL runs payroll systems.", metadata={"year": 1959})],
+    ids=["cobol"],
+)
+
+vector_store.delete(ids=["cobol"])
+vector_store.delete(filter={"year": {"$lt": 1960}})
+```
+
+### Get items by ID
+
+```python Get documents by ID icon="file-search"
+vector_store.get_by_ids(["rust", "go"])
+```
+
+---
+
+## Query vector store
+
+### Directly
+
+Run a similarity search. With the default settings this is TopK's server-side semantic search:
+
+```python Similarity search icon="folders"
+results = vector_store.similarity_search(
+    "memory safe systems programming", k=2, filter={"tags": {"$contains": "systems"}}
+)
+for doc in results:
+    print(f"* {doc.page_content} [{doc.metadata}]")
+```
+
+To get the score of each result:
+
+```python Similarity search with scores icon="star-half"
+results = vector_store.similarity_search_with_score("functional programming", k=2)
+for doc, score in results:
+    print(f"* [SCORE={score:.3f}] {doc.page_content}")
+```
+
+### By turning into retriever
+
+Turn the vector store into a retriever to use it in chains and agents. Every search option on this page also works in `search_kwargs`:
+
+```python Create retriever icon="robot"
+retriever = vector_store.as_retriever(search_kwargs={"k": 2, "mode": "hybrid"})
+retriever.invoke("garbage collection")
+```
+
+---
+
+## Usage for retrieval-augmented generation
+
+<Card
+    title="Retrieval-augmented generation guide"
+    href="/oss/deepagents/rag"
+    icon="search"
+    arrow
+>
+Guide on how to use this vector store for retrieval-augmented generation (RAG)
+</Card>
+
+---
+
+## TopK-specific features
+
+`TopKVectorStore` supports several retrieval modes. Set a default with `retrieval_mode=` when you create the store, or pass `mode=` to any search call:
+
+| Mode | What it scores | Needs |
+| --- | --- | --- |
+| `"semantic"` | TopK's server-side embeddings and reranking | Nothing (default without `embedding`) |
+| `"keyword"` | BM25 | Nothing |
+| `"dense"` | Your own embeddings | `embedding` |
+| `"sparse"` | Sparse vectors such as SPLADE, exact search | `sparse_embedding` |
+| `"multi_vector"` | Late-interaction multi-vectors scored with MaxSim | `multi_vector_embedding` |
+| `"hybrid"` | Any of the above plus BM25, combined in one query | Nothing extra |
+
+### Semantic search without an embedding model
+
+The text field of collections created by `TopKVectorStore` has a TopK [semantic index](https://docs.topk.io/guides/semantic-search). TopK embeds documents and queries on the server, with its own multi-vector model and reranking. You don't run an embedding model, and `from_texts` and `from_documents` work without one:
+
+```python Semantic search icon="sparkles"
+semantic_store = TopKVectorStore.from_texts(
+    [
+        "The Eiffel Tower is in Paris.",
+        "Mount Fuji is the highest mountain in Japan.",
+        "The Great Barrier Reef is off the coast of Australia.",
+    ],
+    collection_name="langchain-landmarks",
+)
+
+semantic_store.similarity_search("famous coral reef", k=1)
+```
+
+<Note>
+    A semantically indexed field holds at most 4,096 characters per document. Split longer documents with a [text splitter](/oss/integrations/splitters) before adding them.
+</Note>
+
+### Keyword search (BM25)
+
+Use `mode="keyword"` (or the `keyword_search` shortcut) for [BM25 keyword search](https://docs.topk.io/guides/keyword-search). By default a document matches when it contains any query term; set `keyword_match_all=True` to require every term:
+
+```python Keyword search icon="search"
+vector_store.keyword_search("garbage collector", k=3)
+```
+
+```python Require every term icon="search"
+vector_store.similarity_search(
+    "garbage goroutines", k=3, mode="keyword", keyword_match_all=True
+)
+```
+
+### Hybrid search
+
+[True hybrid search](https://docs.topk.io/guides/true-hybrid-search) scores semantic similarity, BM25 and any vectors you configured in one query, together with your metadata filter. There is no client-side fusion of separate result lists.
+
+```python Hybrid search icon="git-merge"
+vector_store.similarity_search(
+    "garbage collection",
+    k=3,
+    mode="hybrid",
+    weights={"semantic": 1.0, "keyword": 0.2},
+    filter={"year": {"$gte": 2010}},
+)
+```
+
+`weights` maps each signal (`"semantic"`, `"keyword"`, `"dense"`, `"sparse"`, `"multi_vector"`) to its weight in the final score. Without weights, every configured signal gets weight 1. The scores have different ranges (for example, semantic similarity and BM25), so print a few with `similarity_search_with_score` before you pick weights.
+
+By default, BM25 only boosts documents that contain query terms, so documents that match only by meaning are still returned. To return only documents that contain at least one query term, pass `keyword_required=True`.
+
+### Custom scoring
+
+Pass `ranking` to sort results by your own [scoring expression](https://docs.topk.io/concepts#custom-scoring). It can combine the search scores with metadata fields. `ranking` is a callable that receives the score fields (`s.semantic`, `s.keyword`, `s.dense`, `s.sparse`, `s.multi_vector`) and returns a TopK expression:
+
+```python Custom scoring icon="calculator"
+from topk_sdk.query import field
+
+vector_store.similarity_search(
+    "programming language",
+    k=3,
+    mode="hybrid",
+    ranking=lambda s: s.semantic
+    + s.keyword.coalesce(0.0) * 0.1
+    + (field("metadata.year") > 2000).choose(0.5, 0.0),  # boost newer languages
+)
+```
+
+Metadata fields are under `metadata.`, for example `field("metadata.year")`. A BM25 score is null for documents without a query term, so wrap it in `.coalesce(0.0)` when you add it to other scores. Results are sorted by the `ranking` expression, highest first (pass `ranking_ascending=True` to reverse). The scores returned by `similarity_search_with_score` remain the search scores, not the ranking value.
+
+### Metadata filtering
+
+Pass `filter` as a dict. Keys are metadata keys, and multiple keys are combined with AND:
+
+| Operator | Meaning |
+| --- | --- |
+| `{"key": value}` or `$eq` | Equal |
+| `$ne` | Not equal |
+| `$gt`, `$gte`, `$lt`, `$lte` | Comparison |
+| `$in`, `$nin` | In or not in a list |
+| `$contains` | List contains a value, or text contains a substring |
+| `$starts_with` | Text starts with a prefix |
+| `$exists` | Key is present (`True`) or missing (`False`) |
+| `$and`, `$or`, `$not` | Combine filters |
+
+```python Filter with operators icon="filter"
+vector_store.similarity_search(
+    "programming language",
+    k=5,
+    filter={
+        "$or": [
+            {"lang": {"$in": ["rust", "go"]}},
+            {"year": {"$lt": 1980}},
+        ]
+    },
+)
+```
+
+You can also pass any [TopK filter expression](https://docs.topk.io/collections/query#metadata-filtering):
+
+```python Filter with a TopK expression icon="filter"
+from topk_sdk.query import field
+
+vector_store.similarity_search(
+    "programming language", k=5, filter=field("metadata.year") > 2010
+)
+```
+
+### Self-querying retrieval
+
+`TopKTranslator` turns LangChain structured queries into TopK filters. Pass it to a [self-querying retriever](https://reference.langchain.com/python/langchain-classic/retrievers/self_query/base/SelfQueryRetriever) so that a model can write the filter from a natural-language question. Self-querying needs the `langchain-classic` package and a chat model:
+
+<ChatModelTabs />
+
+```python Self-querying retriever icon="robot"
+from langchain_classic.chains.query_constructor.schema import AttributeInfo
+from langchain_classic.retrievers.self_query.base import SelfQueryRetriever
+from langchain_topk import TopKTranslator
+
+retriever = SelfQueryRetriever.from_llm(
+    llm=model,
+    vectorstore=vector_store,
+    document_contents="A short description of a programming language",
+    metadata_field_info=[
+        AttributeInfo(name="lang", description="Language name", type="string"),
+        AttributeInfo(name="year", description="Year of first release", type="integer"),
+    ],
+    structured_query_translator=TopKTranslator(),
+)
+
+retriever.invoke("languages with a garbage collector released after 2000")
+```
+
+### Bring your own embeddings
+
+Pass any LangChain [embedding model](/oss/integrations/embeddings) as `embedding` to store dense vectors and run [vector search](https://docs.topk.io/guides/vector-search). The collection gets a vector index of the embedding's dimension. Choose the metric with `distance_metric` (`"cosine"`, `"dot_product"` or `"euclidean"`):
+
+<EmbeddingTabs/>
+
+```python Dense vector search icon="vector"
+dense_store = TopKVectorStore.from_documents(
+    documents,
+    embeddings,
+    ids=["rust", "python", "go", "haskell", "sql"],
+    collection_name="langchain-dense",
+)
+
+dense_store.similarity_search("memory safe systems programming", k=2)
+```
+
+Dense stores also support `similarity_search_by_vector`, relevance scores normalized to [0, 1] (`similarity_search_with_relevance_scores`; for `dot_product` and `euclidean` this assumes unit-length embeddings), and maximal marginal relevance (MMR):
+
+```python Maximal marginal relevance icon="arrows-split"
+dense_store.max_marginal_relevance_search(
+    "garbage collector", k=2, fetch_k=5, lambda_mult=0.5
+)
+```
+
+The collection keeps its semantic index, so a dense store can still run `mode="semantic"`, `mode="keyword"`, or a hybrid of all three.
+
+### Sparse vectors
+
+TopK runs [sparse vector search](https://docs.topk.io/guides/sparse-vector-search) exactly, with 100% recall. Use it with learned sparse models such as SPLADE. `FastEmbedSparse` runs SPLADE++ locally with [FastEmbed](https://github.com/qdrant/fastembed):
+
+```python Install FastEmbed icon="download"
+pip install -U "langchain-topk[fastembed]"
+```
+
+```python Sparse vector search icon="grid-dots"
+from langchain_topk import FastEmbedSparse
+
+sparse_store = TopKVectorStore.from_documents(
+    documents,
+    ids=["rust", "python", "go", "haskell", "sql"],
+    collection_name="langchain-sparse",
+    sparse_embedding=FastEmbedSparse(),
+    retrieval_mode="sparse",
+)
+
+sparse_store.similarity_search("memory safety", k=1)
+```
+
+To use another sparse model, subclass `SparseEmbeddings` and return `{index: value}` dicts.
+
+### Multi-vector search
+
+[Multi-vector search](https://docs.topk.io/guides/multi-vector-search) stores one vector per token and scores documents with MaxSim, as late-interaction models such as ColBERT do. `FastEmbedLateInteraction` runs a ColBERT model locally:
+
+```python Multi-vector search icon="layers-intersect"
+from langchain_topk import FastEmbedLateInteraction
+
+multi_vector_store = TopKVectorStore.from_documents(
+    documents,
+    ids=["rust", "python", "go", "haskell", "sql"],
+    collection_name="langchain-multi-vector",
+    multi_vector_embedding=FastEmbedLateInteraction(),
+    retrieval_mode="multi_vector",
+)
+
+multi_vector_store.similarity_search("lazy functional language", k=1)
+```
+
+To use another model, subclass `MultiVectorEmbeddings` and return one list of vectors per text. A store can have dense, sparse and multi-vector embeddings at the same time, and hybrid search combines all of them.
+
+### Multi-tenancy with partitions
+
+A [partition](https://docs.topk.io/concepts#multi-tenancy) is an isolated part of a collection with the same schema, typically one per tenant. A search in one partition never returns another partition's documents. Pass `partition=` when you create the store, or get a copy scoped to a tenant with `with_partition`:
+
+```python Partitions icon="building"
+tenants = TopKVectorStore(collection_name="langchain-tenants")
+
+acme = tenants.with_partition("acme")
+globex = tenants.with_partition("globex")
+
+acme.add_texts(["Acme sells rocket-powered roller skates."], ids=["a1"])
+globex.add_texts(["Globex builds doomsday devices."], ids=["g1"])
+
+acme.similarity_search("rocket", k=5)
+```
+
+Partitions are created on first write. Searching a partition that has never been written returns no results. To remove a tenant and all of its documents, call `delete_partition()`:
+
+```python Delete a partition icon="trash"
+globex.delete_partition()
+tenants.list_partitions()
+```
+
+### Consistency
+
+TopK supports several [read consistency levels](https://docs.topk.io/concepts#read-consistency):
+
+- **Balanced** (default): new writes are searchable in under a second.
+- **Indexed**: reads use only indexed data, for the lowest latency. Documents written in the last few seconds may not be visible yet.
+- **Strong**: every read sees every acknowledged write.
+- **LSN**: every write returns a log sequence number (LSN). A read that passes it sees that write.
+
+By default, `TopKVectorStore` passes the LSN of its latest write to later reads, so you can always read your own writes. Set a default level with `consistency=`, turn off read-your-writes with `read_your_writes=False`, or override either per call:
+
+```python Consistency icon="clock"
+vector_store.similarity_search("garbage collector", k=1, consistency="strong")
+
+vector_store.add_texts(["Zig has compile-time code execution."], ids=["zig"])
+lsn = vector_store.last_lsn
+vector_store.get_by_ids(["zig"], lsn=lsn)
+```
+
+### Run any TopK query
+
+For anything the options above don't cover, `search_with_query` runs a query written with the [TopK query builder](https://docs.topk.io/collections/query) against the store's collection and partition. Select `"text"` to fill `page_content`; metadata is filled in for you. Other selected values are added to each document's metadata:
+
+```python Raw TopK query icon="code"
+from topk_sdk.query import field, fn, select
+
+vector_store.search_with_query(
+    select("text", score=fn.semantic_similarity("text", "databases"))
+    .filter(field("metadata.year") < 2000)
+    .sort(field("score"), asc=False)
+    .limit(2)
+)
+```
+
+---
+
+## API reference
+
+For all `TopKVectorStore` features and configuration, see the [`langchain-topk` repository](https://github.com/topk-io/langchain-topk) and the [TopK documentation](https://docs.topk.io).
