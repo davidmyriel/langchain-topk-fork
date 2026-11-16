@@ -14,7 +14,7 @@ from langchain_core.structured_query import (
     StructuredQuery,
     Visitor,
 )
-from topk_sdk.query import FunctionExpr, LogicalExpr, field, match, not_
+from topk_sdk.query import LogicalExpr, field, match, not_
 
 _COMPARISON_OPERATORS = {
     "$eq",
@@ -38,15 +38,11 @@ _TextExpr: type = next(
     (c for c in type(match("_")).__mro__ if c.__name__ == "TextExpr"),
     type(match("_")),
 )
-_TOPK_EXPR_TYPES: tuple[type, ...] = (LogicalExpr, FunctionExpr, _TextExpr)
 
 
-def is_topk_expr(value: Any) -> bool:
-    """Return True if `value` is already a TopK filter expression."""
-    return isinstance(value, _TOPK_EXPR_TYPES)
-
-
-def build_filter(filter: Any, metadata_field: str) -> Any | None:
+def build_filter(
+    filter: Any, metadata_field: str, *, allow_text: bool = True
+) -> Any | None:
     """Build a TopK filter expression from a LangChain filter.
 
     Accepts:
@@ -67,6 +63,8 @@ def build_filter(filter: Any, metadata_field: str) -> Any | None:
     Args:
         filter: The filter to translate.
         metadata_field: Name of the struct field that stores document metadata.
+        allow_text: Whether to accept text expressions such as `match()`.
+            Deletes accept only logical expressions.
 
     Returns:
         A TopK expression, or `None` if there is no filter.
@@ -80,7 +78,9 @@ def build_filter(filter: Any, metadata_field: str) -> Any | None:
         if not filter:
             return None
         return _translate_dict(filter, metadata_field)
-    if is_topk_expr(filter):
+    if isinstance(filter, LogicalExpr) or (
+        allow_text and isinstance(filter, _TextExpr)
+    ):
         return filter
     msg = (
         "`filter` must be a dict (for example {'genre': 'sci-fi'}) or a TopK "
@@ -151,10 +151,35 @@ def _translate_field(key: str, value: Any, metadata_field: str) -> Any:
                 raise ValueError(msg)
             clauses.append(_compare(path, op, operand))
         return _combine_all(clauses)
+    if isinstance(value, (list, tuple, set)):
+        msg = (
+            f"Filter value for {key!r} is a list. Use {{'$in': [...]}} to match "
+            "any of several values, or {'$contains': value} to match a list field."
+        )
+        raise ValueError(msg)
     return _compare(path, "$eq", value)
 
 
+def _normalize_list(values: Sequence[Any]) -> list[Any]:
+    """Make numeric lists homogeneous: ints and floats mixed become floats."""
+    items = list(values)
+    numeric = [
+        v for v in items if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    if len(numeric) == len(items) and any(isinstance(v, float) for v in items):
+        return [float(v) for v in items]
+    return items
+
+
 def _compare(path: str, op: str, value: Any) -> LogicalExpr:
+    try:
+        return _compare_unchecked(path, op, value)
+    except TypeError as e:
+        msg = f"Invalid value {value!r} for operator {op!r} on {path!r}: {e}"
+        raise ValueError(msg) from e
+
+
+def _compare_unchecked(path: str, op: str, value: Any) -> LogicalExpr:
     f = field(path)
     if op == "$eq":
         return f.eq(value)
@@ -172,7 +197,7 @@ def _compare(path: str, op: str, value: Any) -> LogicalExpr:
         if isinstance(value, str) or not isinstance(value, Sequence) or not value:
             msg = f"`{op}` expects a non-empty list, got {value!r}."
             raise ValueError(msg)
-        expr = f.in_(list(value))
+        expr = f.in_(_normalize_list(value))
         return expr if op == "$in" else not_(expr)
     if op == "$contains":
         return f.contains(value)
@@ -253,10 +278,11 @@ class TopKTranslator(Visitor):
         """Translate a `Comparison`."""
         self._validate_func(comparison.comparator)
         value = comparison.value
-        if isinstance(value, dict) and value.get("type") == "date":
-            # Dates arrive as {"date": "YYYY-MM-DD", "type": "date"}; store and
-            # compare them as ISO strings, which sort chronologically.
-            value = value["date"]
+        if isinstance(value, dict) and value.get("type") in ("date", "datetime"):
+            # Dates arrive as {"date": "YYYY-MM-DD", "type": "date"} and
+            # datetimes as {"datetime": "...", "type": "datetime"}. Compare them
+            # as ISO 8601 strings, which sort chronologically.
+            value = value[value["type"]]
         op = self._COMPARATOR_MAP[comparison.comparator]
         if op in ("$in", "$nin") and not isinstance(value, list):
             value = [value]

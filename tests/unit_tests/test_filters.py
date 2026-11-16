@@ -96,6 +96,8 @@ def test_topk_expression_passthrough() -> None:
         {"$not": [{"a": 1}]},
         {"a": {"$starts_with": 3}},
         "genre == 'x'",
+        {"lang": ["a", "b"]},
+        {"lang": {"$eq": ["a", "b"]}},
     ],
 )
 def test_invalid_filters(bad: object) -> None:
@@ -156,6 +158,27 @@ def test_translator_dates_and_no_filter() -> None:
         "q",
         {},
     )
+
+
+def test_mixed_numeric_in_list_is_homogeneous() -> None:
+    assert "literal" in r(build_filter({"x": {"$in": [1, 2.5]}}, "m"))
+
+
+def test_delete_filters_reject_text_expressions() -> None:
+    with pytest.raises(ValueError):
+        build_filter(match("rust"), "metadata", allow_text=False)
+
+
+def test_translator_datetime() -> None:
+    out = TopKTranslator().visit_comparison(
+        Comparison(
+            comparator=Comparator.GTE,
+            attribute="updated",
+            value={"datetime": "2024-01-01T00:00:00", "type": "datetime"},
+        )
+    )
+    assert out == {"updated": {"$gte": "2024-01-01T00:00:00"}}
+    assert build_filter(out, "metadata") is not None
 
 
 def test_translator_rejects_like() -> None:

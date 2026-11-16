@@ -84,20 +84,26 @@ class FakeAsyncCollection:
         return self.sync.query(q, **opts)
 
 
+class FakeCollectionInfo:
+    def __init__(self, name: str, schema: dict[str, Any]) -> None:
+        self.name = name
+        self.schema = schema
+
+
 class FakeCollections:
     def __init__(self, owner: FakeClient) -> None:
         self.owner = owner
 
-    def get(self, name: str) -> Any:
+    def get(self, name: str) -> FakeCollectionInfo:
         if name not in self.owner.schemas:
             raise CollectionNotFoundError("collection not found")
-        return self.owner.schemas[name]
+        return FakeCollectionInfo(name, self.owner.schemas[name])
 
-    def create(self, name: str, schema: dict[str, Any]) -> Any:
+    def create(self, name: str, schema: dict[str, Any]) -> FakeCollectionInfo:
         self.owner.calls.append(("create", name, schema))
         self.owner.schemas[name] = schema
         self.owner.data.setdefault((name, None), {})
-        return schema
+        return FakeCollectionInfo(name, schema)
 
     def delete(self, name: str) -> None:
         self.owner.calls.append(("delete_collection", name))
@@ -122,9 +128,23 @@ class FakeClient:
         return next(c for c in reversed(self.calls) if c[0] == kind)
 
 
+class FakeAsyncCollections:
+    def __init__(self, sync: FakeCollections) -> None:
+        self.sync = sync
+
+    async def get(self, name: str) -> FakeCollectionInfo:
+        return self.sync.get(name)
+
+    async def create(self, name: str, schema: dict[str, Any]) -> FakeCollectionInfo:
+        return self.sync.create(name, schema)
+
+
 class FakeAsyncClient:
     def __init__(self, sync: FakeClient) -> None:
         self.sync = sync
+
+    def collections(self) -> FakeAsyncCollections:
+        return FakeAsyncCollections(self.sync.collections())
 
     def collection(
         self, name: str, partition: str | None = None

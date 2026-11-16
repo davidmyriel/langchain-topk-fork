@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -21,7 +23,16 @@ from topk_sdk.error import (
     CollectionNotFoundError,
     PartitionNotFoundError,
 )
-from topk_sdk.query import Query, field, fn, match, select, should
+from topk_sdk.query import (
+    FunctionExpr,
+    LogicalExpr,
+    Query,
+    field,
+    fn,
+    match,
+    select,
+    should,
+)
 from topk_sdk.schema import (
     f32_sparse_vector,
     f32_vector,
@@ -33,7 +44,7 @@ from topk_sdk.schema import (
     vector_index,
 )
 
-from langchain_topk._filters import build_filter, is_topk_expr
+from langchain_topk._filters import build_filter
 from langchain_topk.embeddings import (
     MultiVectorEmbeddings,
     SparseEmbeddings,
@@ -44,8 +55,21 @@ from langchain_topk.embeddings import (
 if TYPE_CHECKING:
     from topk_sdk import AsyncCollectionClient, CollectionClient
 
+Consistency = Literal["indexed", "strong"]
+Metric = Literal["cosine", "dot_product", "euclidean"]
+
 MAX_QUERY_RESULTS = 10_000
 """TopK returns at most this many results from a single query."""
+
+MAX_REQUEST_BYTES = 4 * 1024 * 1024
+"""Target upsert payload size, well under TopK's 8MB request limit."""
+
+_METRICS = ("cosine", "dot_product", "euclidean")
+_METRIC_NAMES: dict[str, Metric] = {
+    "Cosine": "cosine",
+    "DotProduct": "dot_product",
+    "Euclidean": "euclidean",
+}
 
 # Score aliases selected in queries. TopK SQL rejects aliases that start with an
 # underscore, so none of these do.
@@ -54,9 +78,6 @@ KEYWORD_SCORE = "keyword_score"
 DENSE_SCORE = "dense_score"
 SPARSE_SCORE = "sparse_score"
 MULTI_VECTOR_SCORE = "multi_vector_score"
-
-Consistency = Literal["indexed", "strong"]
-Metric = Literal["cosine", "dot_product", "euclidean"]
 
 
 class RetrievalMode(str, Enum):
@@ -208,8 +229,8 @@ class TopKVectorStore(VectorStore):
         vector_field: str = "dense_vector",
         sparse_vector_field: str = "sparse_vector",
         multi_vector_field: str = "multi_vector",
-        text_index: TextIndex | str = TextIndex.SEMANTIC,
-        distance_metric: Metric = "cosine",
+        text_index: TextIndex | str | None = None,
+        distance_metric: Metric | None = None,
         hybrid_weights: Mapping[str, float] | None = None,
         consistency: Consistency | None = None,
         read_your_writes: bool = True,
@@ -243,18 +264,23 @@ class TopKVectorStore(VectorStore):
             multi_vector_field: Field that stores multi-vectors.
             text_index: Index for the text field when the collection is
                 created: `"semantic"` (default, server-side embeddings and
-                BM25), `"keyword"` (BM25 only) or `"none"`.
-            distance_metric: Metric for the dense vector index: `"cosine"`,
-                `"dot_product"` or `"euclidean"`.
+                BM25), `"keyword"` (BM25 only) or `"none"`. For an existing
+                collection it is read from the collection's schema.
+            distance_metric: Metric for the dense vector index: `"cosine"`
+                (default), `"dot_product"` or `"euclidean"`. For an existing
+                collection it is read from the collection's schema.
             hybrid_weights: Default weights for hybrid search, keyed by signal:
                 `"semantic"`, `"keyword"`, `"dense"`, `"sparse"`,
-                `"multi_vector"`. Signals that are not configured are ignored.
+                `"multi_vector"`. Every key must be a signal this store is
+                configured for.
             consistency: Default read consistency: `None` (balanced, TopK's
                 default), `"indexed"` or `"strong"`.
             read_your_writes: Pass the LSN of this store's latest write to
                 later reads, so they always see that write. Applies only to
                 reads that set neither `lsn` nor `consistency`.
-            create_collection: Create the collection if it does not exist.
+            create_collection: Create the collection if it does not exist,
+                or check an existing collection's schema against these
+                settings. With `False`, no network call is made.
         """
         if not collection_name:
             msg = "`collection_name` is required."
@@ -270,25 +296,27 @@ class TopKVectorStore(VectorStore):
         self.vector_field = vector_field
         self.sparse_vector_field = sparse_vector_field
         self.multi_vector_field = multi_vector_field
-        self.text_index = TextIndex(text_index)
-        if distance_metric not in ("cosine", "dot_product", "euclidean"):
+        self._requested_text_index = (
+            TextIndex(text_index) if text_index is not None else None
+        )
+        self.text_index = self._requested_text_index or TextIndex.SEMANTIC
+        if distance_metric is not None and distance_metric not in _METRICS:
             msg = (
                 "`distance_metric` must be 'cosine', 'dot_product' or "
                 f"'euclidean', got {distance_metric!r}."
             )
             raise ValueError(msg)
-        self.distance_metric: Metric = distance_metric
+        self._requested_metric = distance_metric
+        self.distance_metric: Metric = distance_metric or "cosine"
         self.consistency = consistency
         self.read_your_writes = read_your_writes
         self.hybrid_weights = dict(hybrid_weights or {})
         self._validate_weights(self.hybrid_weights)
-
-        if retrieval_mode is None:
-            retrieval_mode = (
-                RetrievalMode.DENSE if embedding is not None else RetrievalMode.SEMANTIC
-            )
-        self.retrieval_mode = RetrievalMode(retrieval_mode)
-        self._check_mode(self.retrieval_mode)
+        self._requested_mode = (
+            RetrievalMode(retrieval_mode) if retrieval_mode is not None else None
+        )
+        self.retrieval_mode = RetrievalMode.SEMANTIC
+        self._finalize_config()
 
         self._api_key = api_key
         self._region = region
@@ -301,6 +329,21 @@ class TopKVectorStore(VectorStore):
 
         if create_collection:
             self._ensure_collection()
+
+    def _finalize_config(self) -> None:
+        """Resolve the default retrieval mode and validate the configuration."""
+        mode = self._requested_mode
+        if mode is None:
+            mode = (
+                RetrievalMode.DENSE
+                if self._embedding is not None
+                else RetrievalMode.SEMANTIC
+            )
+        self._check_mode(mode)
+        self.retrieval_mode = mode
+        if self.hybrid_weights:
+            # Fail at construction, not at the first hybrid search.
+            self._signals(RetrievalMode.HYBRID, None)
 
     # ------------------------------------------------------------------
     # Clients and collection management
@@ -375,10 +418,12 @@ class TopKVectorStore(VectorStore):
     def _ensure_collection(self) -> None:
         collections = self.client.collections()
         try:
-            collections.get(self.collection_name)
-            return
+            existing = collections.get(self.collection_name)
         except CollectionNotFoundError:
-            pass
+            existing = None
+        if existing is not None:
+            self._reconcile_schema(existing.schema)
+            return
         dense_dim = (
             len(self._embedding.embed_query("dimension probe"))
             if self._embedding is not None
@@ -395,7 +440,97 @@ class TopKVectorStore(VectorStore):
                 self.collection_name, schema=self._schema(dense_dim, multi_dim)
             )
         except CollectionAlreadyExistsError:
-            pass
+            self._reconcile_schema(collections.get(self.collection_name).schema)
+
+    async def _aensure_collection(self) -> None:
+        collections = self.async_client.collections()
+        try:
+            existing = await collections.get(self.collection_name)
+        except CollectionNotFoundError:
+            existing = None
+        if existing is not None:
+            self._reconcile_schema(existing.schema)
+            return
+        dense_dim = (
+            len(await self._embedding.aembed_query("dimension probe"))
+            if self._embedding is not None
+            else None
+        )
+        multi_dim = None
+        if self.multi_vector_embedding is not None:
+            probe = normalize_multi_vector(
+                await self.multi_vector_embedding.aembed_query("dimension probe")
+            )
+            multi_dim = len(probe[0])
+        try:
+            await collections.create(
+                self.collection_name, schema=self._schema(dense_dim, multi_dim)
+            )
+        except CollectionAlreadyExistsError:
+            existing = await collections.get(self.collection_name)
+            self._reconcile_schema(existing.schema)
+
+    def _reconcile_schema(self, schema: Mapping[str, Any]) -> None:
+        """Check an existing collection's schema against this store's settings.
+
+        The text index and vector metric are read from the schema (a field's
+        metric is only visible in its text form). A setting that contradicts
+        the schema raises `ValueError` instead of silently returning wrong
+        results.
+        """
+        specs = {name: str(spec) for name, spec in schema.items()}
+        where = f"collection {self.collection_name!r}"
+
+        text_spec = specs.get(self.text_field, "")
+        if "SemanticIndex" in text_spec:
+            actual_index = TextIndex.SEMANTIC
+        elif "KeywordIndex" in text_spec:
+            actual_index = TextIndex.KEYWORD
+        else:
+            actual_index = TextIndex.NONE
+        requested = self._requested_text_index
+        if requested is not None and requested != actual_index:
+            msg = (
+                f"`text_index={requested.value!r}` does not match {where}, whose "
+                f"field {self.text_field!r} has text index {actual_index.value!r}."
+            )
+            raise ValueError(msg)
+        self.text_index = actual_index
+
+        def indexed(field_name: str, kind: str, what: str) -> str:
+            spec = specs.get(field_name)
+            if spec is None or kind not in spec:
+                msg = (
+                    f"{what} needs an indexed field {field_name!r}, but {where} "
+                    f"has {spec or 'no such field'}. Use a new collection, or set "
+                    "the field name to an indexed field of this collection."
+                )
+                raise ValueError(msg)
+            return spec
+
+        if self._embedding is not None:
+            spec = indexed(self.vector_field, "VectorIndex", "`embedding`")
+            metric = next(
+                (m for name, m in _METRIC_NAMES.items() if f"metric: {name}" in spec),
+                None,
+            )
+            if metric is not None:
+                if self._requested_metric not in (None, metric):
+                    msg = (
+                        f"`distance_metric={self._requested_metric!r}` does not "
+                        f"match {where}, whose vector index uses {metric!r}."
+                    )
+                    raise ValueError(msg)
+                self.distance_metric = metric
+        if self.sparse_embedding is not None:
+            indexed(self.sparse_vector_field, "VectorIndex", "`sparse_embedding`")
+        if self.multi_vector_embedding is not None:
+            indexed(
+                self.multi_vector_field,
+                "MultiVectorIndex",
+                "`multi_vector_embedding`",
+            )
+        self._finalize_config()
 
     def delete_collection(self) -> None:
         """Delete the whole TopK collection, including every partition.
@@ -405,6 +540,7 @@ class TopKVectorStore(VectorStore):
             recreated under the same name can be lost. Use a new name instead.
         """
         self.client.collections().delete(self.collection_name)
+        self.last_lsn = None
 
     def delete_partition(self, partition: str | None = None) -> None:
         """Delete a partition (tenant) and all of its documents.
@@ -417,6 +553,8 @@ class TopKVectorStore(VectorStore):
             msg = "No partition given and this store is not scoped to one."
             raise ValueError(msg)
         self.client.collection(self.collection_name).delete_partition(name)
+        if name == self.partition:
+            self.last_lsn = None
 
     def list_partitions(self) -> list[str]:
         """Return the names of the collection's partitions."""
@@ -508,7 +646,8 @@ class TopKVectorStore(VectorStore):
         dense: Sequence[list[float]] | None,
         sparse: Sequence[Any] | None,
         multi: Sequence[Any] | None,
-    ) -> tuple[list[str], list[dict[str, Any]]]:
+    ) -> tuple[list[str], list[dict[str, Any]], list[int]]:
+        """Build TopK rows. Also returns an estimated payload size per row."""
         n = len(texts)
         if metadatas is not None and len(metadatas) != n:
             msg = f"Got {len(metadatas)} metadatas for {n} texts."
@@ -521,23 +660,44 @@ class TopKVectorStore(VectorStore):
             for i in (ids if ids is not None else [None] * n)
         ]
         rows: list[dict[str, Any]] = []
+        sizes: list[int] = []
         for idx, (doc_id, content) in enumerate(zip(out_ids, texts, strict=True)):
             row: dict[str, Any] = {"_id": doc_id, self.text_field: content}
+            size = 64 + len(doc_id) + len(content.encode("utf-8"))
             metadata = metadatas[idx] if metadatas is not None else None
             if metadata:
                 row[self.metadata_field] = dict(metadata)
+                size += len(json.dumps(metadata, default=str))
             if dense is not None:
                 row[self.vector_field] = [float(x) for x in dense[idx]]
+                size += 4 * len(row[self.vector_field])
             if sparse is not None:
-                row[self.sparse_vector_field] = sparse_data(
-                    normalize_sparse(sparse[idx])
-                )
+                sparse_vec = normalize_sparse(sparse[idx])
+                row[self.sparse_vector_field] = sparse_data(sparse_vec)
+                size += 8 * len(sparse_vec)
             if multi is not None:
-                row[self.multi_vector_field] = matrix_data(
-                    normalize_multi_vector(multi[idx]), value_type="f32"
-                )
+                rows_mv = normalize_multi_vector(multi[idx])
+                row[self.multi_vector_field] = matrix_data(rows_mv, value_type="f32")
+                size += 4 * sum(len(r) for r in rows_mv)
             rows.append(row)
-        return out_ids, rows
+            sizes.append(size)
+        return out_ids, rows, sizes
+
+    @staticmethod
+    def _size_batches(
+        rows: list[dict[str, Any]], sizes: list[int]
+    ) -> Iterable[list[dict[str, Any]]]:
+        """Split rows into upsert requests that stay under the request limit."""
+        batch: list[dict[str, Any]] = []
+        total = 0
+        for row, size in zip(rows, sizes, strict=True):
+            if batch and total + size > MAX_REQUEST_BYTES:
+                yield batch
+                batch, total = [], 0
+            batch.append(row)
+            total += size
+        if batch:
+            yield batch
 
     def add_texts(
         self,
@@ -557,11 +717,19 @@ class TopKVectorStore(VectorStore):
             texts: Texts to add.
             metadatas: Optional metadata dict for each text.
             ids: Optional ID for each text. Random UUIDs are used otherwise.
-            batch_size: Number of documents per upsert request.
+            batch_size: Number of documents embedded per batch. Upserts are
+                further split so that each request stays well under TopK's
+                8MB request limit.
             **kwargs: Unused.
 
         Returns:
             The IDs of the added texts.
+
+        Note:
+            Writes are not transactional. If a request fails, documents from
+            earlier requests stay written and `last_lsn` points at the last
+            successful write. Retrying with the same `ids` is safe, because
+            upserts replace documents with the same ID.
         """
         texts = list(texts)
         if not texts:
@@ -584,10 +752,11 @@ class TopKVectorStore(VectorStore):
                 if self.multi_vector_embedding
                 else None
             )
-            out_ids, rows = self._build_rows(
+            out_ids, rows, sizes = self._build_rows(
                 chunk, chunk_meta, chunk_ids, dense, sparse, multi
             )
-            self.last_lsn = self._collection().upsert(rows)
+            for request in self._size_batches(rows, sizes):
+                self.last_lsn = self._collection().upsert(request)
             all_ids.extend(out_ids)
         return all_ids
 
@@ -629,10 +798,11 @@ class TopKVectorStore(VectorStore):
                 if self.multi_vector_embedding
                 else None
             )
-            out_ids, rows = self._build_rows(
+            out_ids, rows, sizes = self._build_rows(
                 chunk, chunk_meta, chunk_ids, dense, sparse, multi
             )
-            self.last_lsn = await self._acollection().upsert(rows)
+            for request in self._size_batches(rows, sizes):
+                self.last_lsn = await self._acollection().upsert(request)
             all_ids.extend(out_ids)
         return all_ids
 
@@ -642,7 +812,7 @@ class TopKVectorStore(VectorStore):
             raise ValueError(msg)
         if ids is not None:
             return [str(i) for i in ids]
-        expr = build_filter(filter, self.metadata_field)
+        expr = build_filter(filter, self.metadata_field, allow_text=False)
         if expr is None:
             msg = (
                 "Pass `ids` or a `filter` to delete. To remove everything, use "
@@ -812,6 +982,7 @@ class TopKVectorStore(VectorStore):
         keyword_match_all: bool = False,
         keyword_required: bool = False,
         ranking: Any = None,
+        ranking_ascending: bool = False,
         dense_vector: Sequence[float] | None = None,
         sparse_vector: Any = None,
         multi_vector: Any = None,
@@ -876,10 +1047,13 @@ class TopKVectorStore(VectorStore):
         self._check_k(limit)
         if ranking is not None:
             sort_expr = ranking(_ScoreFields()) if callable(ranking) else ranking
-            if not is_topk_expr(sort_expr):
-                msg = "`ranking` must be a TopK expression or a callable returning one."
+            if not isinstance(sort_expr, (LogicalExpr, FunctionExpr)):
+                msg = (
+                    "`ranking` must be a TopK scoring expression, or a callable "
+                    "returning one."
+                )
                 raise ValueError(msg)
-            q = q.sort(sort_expr, asc=False)
+            q = q.sort(sort_expr, asc=ranking_ascending)
         else:
             q = q.sort(self._combined_score(signals), asc=self._ascending(signals))
         return q.limit(limit), signals
@@ -958,6 +1132,7 @@ class TopKVectorStore(VectorStore):
             "keyword_match_all",
             "keyword_required",
             "ranking",
+            "ranking_ascending",
         }
         unknown = set(kwargs) - allowed - {"mode"}
         if unknown:
@@ -1018,7 +1193,11 @@ class TopKVectorStore(VectorStore):
                 * `ranking`: custom scoring expression used to sort results.
                   Either a TopK expression or a callable that receives the
                   score fields (`s.semantic`, `s.keyword`, `s.dense`,
-                  `s.sparse`, `s.multi_vector`) and returns one.
+                  `s.sparse`, `s.multi_vector`) and returns one. Results are
+                  sorted by it in descending order (pass
+                  `ranking_ascending=True` to reverse). The returned scores are
+                  still the signal scores described below, not the ranking
+                  value, so they may not be in sorted order.
                 * `lsn` / `consistency`: read consistency for this call.
 
         Returns:
@@ -1173,20 +1352,50 @@ class TopKVectorStore(VectorStore):
     # Relevance scores
     # ------------------------------------------------------------------
 
-    def _select_relevance_score_fn(self) -> Callable[[float], float]:
-        if self.retrieval_mode != RetrievalMode.DENSE:
+    def _relevance_fn(self, mode: RetrievalMode) -> Callable[[float], float]:
+        if mode != RetrievalMode.DENSE:
             msg = (
                 "Normalized relevance scores are only defined for dense vector "
-                "search. Semantic, BM25 and hybrid scores are not bounded; use "
+                f"search, not for mode {mode.value!r}: semantic, BM25, sparse, "
+                "multi-vector and hybrid scores are not bounded. Use "
                 "`similarity_search_with_score` instead."
             )
             raise NotImplementedError(msg)
-        if self.distance_metric == "cosine":
-            # TopK returns cosine similarity in [-1, 1].
-            return lambda score: (score + 1.0) / 2.0
-        if self.distance_metric == "dot_product":
-            return self._max_inner_product_relevance_score_fn
-        return self._euclidean_relevance_score_fn
+        if self.distance_metric == "euclidean":
+            # TopK returns the distance (lower is better); assumes unit vectors.
+            return lambda d: _clamp01(1.0 - d / math.sqrt(2))
+        # Cosine similarity, and the raw dot product of unit vectors, are in
+        # [-1, 1] with higher being better.
+        return lambda s: _clamp01((s + 1.0) / 2.0)
+
+    def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        return self._relevance_fn(self.retrieval_mode)
+
+    def _similarity_search_with_relevance_scores(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> list[tuple[Document, float]]:
+        relevance = self._relevance_fn(self._resolve_mode(kwargs.get("mode")))
+        if kwargs.get("ranking") is not None:
+            msg = "Relevance scores cannot be computed with a custom `ranking`."
+            raise ValueError(msg)
+        return [
+            (doc, relevance(score))
+            for doc, score in self.similarity_search_with_score(query, k, **kwargs)
+        ]
+
+    async def _asimilarity_search_with_relevance_scores(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> list[tuple[Document, float]]:
+        relevance = self._relevance_fn(self._resolve_mode(kwargs.get("mode")))
+        if kwargs.get("ranking") is not None:
+            msg = "Relevance scores cannot be computed with a custom `ranking`."
+            raise ValueError(msg)
+        return [
+            (doc, relevance(score))
+            for doc, score in await self.asimilarity_search_with_score(
+                query, k, **kwargs
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Maximal marginal relevance
@@ -1356,8 +1565,9 @@ class TopKVectorStore(VectorStore):
         if not collection_name:
             msg = "`collection_name` is required."
             raise ValueError(msg)
+        batch_size = kwargs.pop("batch_size", 256)
         store = cls(collection_name, embedding, **kwargs)
-        store.add_texts(texts, metadatas, ids=ids)
+        store.add_texts(texts, metadatas, ids=ids, batch_size=batch_size)
         return store
 
     @classmethod
@@ -1375,8 +1585,14 @@ class TopKVectorStore(VectorStore):
         if not collection_name:
             msg = "`collection_name` is required."
             raise ValueError(msg)
-        store = cls(collection_name, embedding, **kwargs)
-        await store.aadd_texts(texts, metadatas, ids=ids)
+        batch_size = kwargs.pop("batch_size", 256)
+        create_collection = kwargs.pop("create_collection", True)
+        # Build without network calls, then create or check the collection
+        # with the async client so the event loop is never blocked.
+        store = cls(collection_name, embedding, create_collection=False, **kwargs)
+        if create_collection:
+            await store._aensure_collection()
+        await store.aadd_texts(texts, metadatas, ids=ids, batch_size=batch_size)
         return store
 
     @classmethod
@@ -1416,6 +1632,10 @@ class TopKVectorStore(VectorStore):
             ids=ids,
             **kwargs,
         )
+
+
+def _clamp01(value: float) -> float:
+    return min(1.0, max(0.0, value))
 
 
 _SCORE_ALIAS = {

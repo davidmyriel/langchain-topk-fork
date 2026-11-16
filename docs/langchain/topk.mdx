@@ -275,7 +275,7 @@ vector_store.similarity_search(
 )
 ```
 
-Metadata fields are under `metadata.`, for example `field("metadata.year")`. A BM25 score is null for documents without a query term, so wrap it in `.coalesce(0.0)` when you add it to other scores.
+Metadata fields are under `metadata.`, for example `field("metadata.year")`. A BM25 score is null for documents without a query term, so wrap it in `.coalesce(0.0)` when you add it to other scores. Results are sorted by the `ranking` expression, highest first (pass `ranking_ascending=True` to reverse). The scores returned by `similarity_search_with_score` remain the search scores, not the ranking value.
 
 ### Metadata filtering
 
@@ -357,7 +357,7 @@ dense_store = TopKVectorStore.from_documents(
 dense_store.similarity_search("memory safe systems programming", k=2)
 ```
 
-Dense stores also support `similarity_search_by_vector`, normalized relevance scores and maximal marginal relevance (MMR):
+Dense stores also support `similarity_search_by_vector`, relevance scores normalized to [0, 1] (`similarity_search_with_relevance_scores`; for `dot_product` and `euclidean` this assumes unit-length embeddings), and maximal marginal relevance (MMR):
 
 ```python Maximal marginal relevance icon="arrows-split"
 dense_store.max_marginal_relevance_search(

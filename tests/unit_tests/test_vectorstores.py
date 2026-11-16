@@ -5,11 +5,19 @@ from typing import Any
 import pytest
 from langchain_core.documents import Document
 from langchain_core.embeddings import DeterministicFakeEmbedding
+from topk_sdk.schema import (
+    f32_vector,
+    keyword_index,
+    semantic_index,
+    text,
+    vector_index,
+)
 
 from langchain_topk import (
     MultiVectorEmbeddings,
     RetrievalMode,
     SparseEmbeddings,
+    TextIndex,
     TopKVectorStore,
 )
 from tests.unit_tests.fake_topk import FakeAsyncClient, FakeClient
@@ -82,9 +90,68 @@ def test_full_schema() -> None:
 
 def test_existing_collection_is_not_recreated() -> None:
     client = FakeClient()
-    client.schemas["test"] = {"text": None}
+    client.schemas["test"] = {"text": text().index(semantic_index())}
     TopKVectorStore("test", client=client)  # type: ignore[arg-type]
     assert not [c for c in client.calls if c[0] == "create"]
+
+
+def test_existing_collection_settings_come_from_schema() -> None:
+    client = FakeClient()
+    client.schemas["test"] = {
+        "text": text().index(keyword_index()),
+        "dense_vector": f32_vector(3).index(vector_index(metric="euclidean")),
+    }
+    store = TopKVectorStore(
+        "test",
+        DeterministicFakeEmbedding(size=3),
+        client=client,  # type: ignore[arg-type]
+    )
+    assert store.distance_metric == "euclidean"
+    assert store.text_index == TextIndex.KEYWORD
+
+
+@pytest.mark.parametrize(
+    ("schema", "kwargs", "message"),
+    [
+        (
+            {"text": text().index(semantic_index())},
+            {"embedding": DeterministicFakeEmbedding(size=3)},
+            "indexed field 'dense_vector'",
+        ),
+        (
+            {
+                "text": text().index(semantic_index()),
+                "dense_vector": f32_vector(3).index(vector_index(metric="cosine")),
+            },
+            {
+                "embedding": DeterministicFakeEmbedding(size=3),
+                "distance_metric": "euclidean",
+            },
+            "does not match",
+        ),
+        (
+            {"text": text().index(keyword_index())},
+            {"text_index": "semantic"},
+            "does not match",
+        ),
+        ({"text": text()}, {}, "Semantic search needs"),
+        (
+            {"text": text().index(semantic_index())},
+            {"sparse_embedding": FakeSparse()},
+            "sparse_vector",
+        ),
+    ],
+)
+def test_existing_collection_mismatch(schema: dict, kwargs: dict, message: str) -> None:
+    client = FakeClient()
+    client.schemas["test"] = schema
+    with pytest.raises(ValueError, match=message):
+        TopKVectorStore("test", client=client, **kwargs)  # type: ignore[arg-type]
+
+
+def test_hybrid_weights_validated_at_init() -> None:
+    with pytest.raises(ValueError, match="not configured"):
+        make_store(hybrid_weights={"dense": 1.0})
 
 
 def test_keyword_text_index() -> None:
@@ -365,6 +432,91 @@ def test_relevance_scores_only_for_dense() -> None:
     assert dense._select_relevance_score_fn()(-1.0) == 0.0
 
 
+@pytest.mark.parametrize("metric", ["cosine", "dot_product", "euclidean"])
+def test_relevance_scores_keep_ranking_order(metric: str) -> None:
+    store, client = make_store(
+        embedding=DeterministicFakeEmbedding(size=3), distance_metric=metric
+    )
+    store.add_texts(["a", "b"], ids=["1", "2"])
+    best, worst = (0.1, 0.9) if metric == "euclidean" else (0.95, -0.5)
+    client.query_results = [
+        {"_id": "1", "text": "a", "dense_score": best},
+        {"_id": "2", "text": "b", "dense_score": worst},
+    ]
+    scored = store.similarity_search_with_relevance_scores("q", k=2)
+    assert [d.id for d, _ in scored] == ["1", "2"]
+    assert scored[0][1] > scored[1][1]
+    assert all(0.0 <= s <= 1.0 for _, s in scored)
+    kept = store.similarity_search_with_relevance_scores("q", k=2, score_threshold=0.5)
+    assert [d.id for d, _ in kept] == ["1"]
+
+
+def test_relevance_scores_follow_per_call_mode() -> None:
+    store, client = make_store(
+        embedding=DeterministicFakeEmbedding(size=3), retrieval_mode="semantic"
+    )
+    store.add_texts(["a"], ids=["1"])
+    client.query_results = [{"_id": "1", "text": "a", "dense_score": 1.0}]
+    assert store.similarity_search_with_relevance_scores("q", mode="dense")[0][1] == 1
+    with pytest.raises(NotImplementedError, match="hybrid"):
+        store.similarity_search_with_relevance_scores("q", mode="hybrid")
+    with pytest.raises(NotImplementedError):
+        store.similarity_search_with_relevance_scores("q")
+
+
+def test_large_upserts_are_split_by_size() -> None:
+    class BigMulti(MultiVectorEmbeddings):
+        def embed_documents(self, texts: list[str]) -> list[list[list[float]]]:
+            return [[[0.1] * 128 for _ in range(300)] for _ in texts]
+
+        def embed_query(self, text: str) -> list[list[float]]:
+            return [[0.1] * 128]
+
+    store, client = make_store(multi_vector_embedding=BigMulti())
+    ids = store.add_texts([f"doc {i}" for i in range(100)])
+    upserts = [c for c in client.calls if c[0] == "upsert"]
+    assert len(upserts) > 1
+    assert sum(len(c[2]) for c in upserts) == 100 == len(ids)
+
+
+def test_from_texts_accepts_batch_size() -> None:
+    client = FakeClient()
+    TopKVectorStore.from_texts(
+        ["a", "b", "c"],
+        collection_name="c",
+        client=client,  # type: ignore[arg-type]
+        batch_size=2,
+    )
+    assert len([c for c in client.calls if c[0] == "upsert"]) == 2
+
+
+def test_lsn_reset_after_partition_delete() -> None:
+    store, _ = make_store(partition="acme")
+    store.add_texts(["a"])
+    assert store.last_lsn is not None
+    store.delete_partition()
+    assert store.last_lsn is None
+
+
+def test_ranking_rejects_text_expression_and_supports_ascending() -> None:
+    from topk_sdk.query import field, match
+
+    store, client = make_store()
+    store.add_texts(["a"])
+    with pytest.raises(ValueError, match="ranking"):
+        store.similarity_search("q", ranking=match("x"))
+    store.similarity_search("q", ranking=field("metadata.year"), ranking_ascending=True)
+    assert "order: Asc" in repr(client.last("query")[2])
+
+
+def test_delete_rejects_text_filter() -> None:
+    from topk_sdk.query import match
+
+    store, _ = make_store()
+    with pytest.raises(ValueError):
+        store.delete(filter=match("x"))
+
+
 def test_mmr_fetches_vectors_by_id() -> None:
     store, client = make_store(embedding=DeterministicFakeEmbedding(size=3))
     store.add_texts(["a", "b", "c"], ids=["1", "2", "3"])
@@ -430,6 +582,37 @@ def test_partition_management() -> None:
 
 
 # --- async ---------------------------------------------------------------------
+
+
+async def test_afrom_texts_uses_only_the_async_client() -> None:
+    client = FakeClient()
+
+    class NoSyncClient:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"sync client used: {name}")
+
+    store = await TopKVectorStore.afrom_texts(
+        ["a"],
+        collection_name="c",
+        client=NoSyncClient(),  # type: ignore[arg-type]
+        async_client=FakeAsyncClient(client),  # type: ignore[arg-type]
+    )
+    assert client.last("create")[1] == "c"
+    assert store.retrieval_mode == RetrievalMode.SEMANTIC
+
+
+async def test_async_keyword_and_hybrid() -> None:
+    client = FakeClient()
+    store = await TopKVectorStore.afrom_texts(
+        ["a"],
+        collection_name="c",
+        client=client,  # type: ignore[arg-type]
+        async_client=FakeAsyncClient(client),  # type: ignore[arg-type]
+    )
+    await store.asimilarity_search("q", mode="keyword")
+    assert "should: false" in repr(client.last("query")[2])
+    await store.asimilarity_search("q", mode="hybrid")
+    assert "should: true" in repr(client.last("query")[2])
 
 
 async def test_async_roundtrip() -> None:

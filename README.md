@@ -97,7 +97,8 @@ acme = vector_store.with_partition("acme")
 acme.add_texts(["Acme sells rocket-powered roller skates."])
 acme.delete_partition()
 
-# Consistency: balanced (default), "indexed", "strong", or an LSN
+# Consistency: balanced (TopK's default), "indexed", "strong", or an LSN.
+# By default a store also reads its own writes, by passing its last write's LSN.
 vector_store.similarity_search("garbage collector", consistency="strong")
 vector_store.get_by_ids(["some-id"], lsn=vector_store.last_lsn)
 ```
